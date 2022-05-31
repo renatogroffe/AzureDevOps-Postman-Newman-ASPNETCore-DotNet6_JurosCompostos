@@ -1,0 +1,138 @@
+trigger:
+- main
+
+resources:
+- repo: self
+
+variables:
+
+  # Container registry service connection established during pipeline creation
+  dockerRegistryServiceConnection: 'CONNECTION ACR'
+  imageRepository: 'financasjwt'
+  containerRegistry: 'test.azurecr.io'
+  dockerfilePath: '**/Dockerfile'
+  tag: '$(Build.BuildId)'
+  imagePullSecret: 'SECRET'
+
+  # Agent VM image name
+  vmImageName: 'ubuntu-latest'
+
+  # Variáveis execução testes
+  File_Log_Execucao_WebApp: 'log-execucao-restapi.log'
+  Path_Projeto: './APIFinancas'
+  Path_Tests: './Tests'
+  Executavel_Projeto: 'APIFinancas.dll'
+  Collection_Postman: 'CalculoJurosCompostosJWT.postman_collection.json'
+  DataFile_Postman: 'data-tests.json'
+  
+stages:
+- stage: Tests
+  displayName: Tests stage
+  jobs:
+  - job: Tests
+    displayName: Tests
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - script: |
+        dotnet --version
+        dotnet publish $(Path_Projeto) -c Release -o app
+        cd ./app
+        nohup dotnet $(Executavel_Projeto) > $(File_Log_Execucao_WebApp) 2>&1 &
+        echo 'Aguardando a inicialização da aplicação a ser testada...'
+        sleep 10s
+      displayName: Executar a aplicação a ser testada em background (nohup)
+      env:
+        ASPNETCORE_URLS: 'http://localhost:5000'
+    - script: |
+        cd $(Path_Tests)
+        newman run $(Collection_Postman) -d $(DataFile_Postman)
+      displayName: Executar testes da API REST com Newman
+      condition: always() 
+    - script: |
+        echo "** Versão Global do Newman **"
+        newman -v
+        npm install newman-reporter-htmlextra@1.22.9
+        npm install newman-reporter-junitfullreport@1.0.4
+      displayName:  Instalar packages newman-reporter-htmlextra e newman-reporter-junitfullreport
+      condition: always() 
+    - script: |
+        cd $(Path_Tests)
+        npx newman run $(Collection_Postman) -d $(DataFile_Postman) -r htmlextra,junitfullreport
+        cd ./newman
+        ls
+      displayName: Gerar resultados em HTML e XML dos testes da API REST com Newman
+      condition: always() 
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/newman/*.xml'
+        searchFolder: '$(Build.SourcesDirectory)'
+      displayName: Publicar sumário dos testes com base no XML gerado
+      condition: always()
+    - task: UploadPostmanHtmlReport@1
+      displayName: Publicar relatório em HTML com resultados dos testes da API REST com Newman
+      inputs:
+        cwd: '$(System.DefaultWorkingDirectory)/$(Path_Tests)'
+      condition: always() 
+    - script: |
+        cd ./app
+        cat $(File_Log_Execucao_WebApp)
+      displayName: Exibir log de execução da aplicação testada
+      condition: Always()
+
+- stage: Build
+  displayName: Build stage
+  dependsOn: Tests
+
+  jobs:
+  - job: Build
+    displayName: Build
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: Docker@2
+      displayName: Build and push an image to container registry
+      inputs:
+        command: buildAndPush
+        repository: $(imageRepository)
+        dockerfile: $(dockerfilePath)
+        containerRegistry: $(dockerRegistryServiceConnection)
+        tags: |
+          $(tag)
+
+    - upload: manifests
+      artifact: manifests
+
+- stage: Deploy
+  displayName: Deploy stage
+  dependsOn: Build
+
+  jobs:
+  - deployment: Deploy
+    displayName: Deploy
+    pool:
+      vmImage: $(vmImageName)
+    environment: 'FinancasJWT.livecanaldotnet'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: KubernetesManifest@0
+            displayName: Create imagePullSecret
+            inputs:
+              action: createSecret
+              secretName: $(imagePullSecret)
+              dockerRegistryEndpoint: $(dockerRegistryServiceConnection)
+
+          - task: KubernetesManifest@0
+            displayName: Deploy to Kubernetes cluster
+            inputs:
+              action: deploy
+              manifests: |
+                $(Pipeline.Workspace)/manifests/deployment.yml
+                $(Pipeline.Workspace)/manifests/service.yml
+              imagePullSecrets: |
+                $(imagePullSecret)
+              containers: |
+                $(containerRegistry)/$(imageRepository):$(tag)
